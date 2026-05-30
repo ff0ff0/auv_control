@@ -4,7 +4,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObjectCfg
 
 
-USD_PATH = os.path.join(os.path.dirname(__file__), "../data/warpauv/warpauv.usd")
+USD_PATH = "/home/linc/project/RL/isaac_underwater/isaac_navigation_task/assets/BlueRov/bluerov_heavy/bluerov_heavy/bluerov_heavy.usd"
 
 WARPAUV_CFG = RigidObjectCfg(
     prim_path="{ENV_REGEX_NS}/Robot",
@@ -14,9 +14,6 @@ WARPAUV_CFG = RigidObjectCfg(
             disable_gravity=False,
             max_depenetration_velocity=10.0,
             enable_gyroscopic_forces=True,
-        ),
-        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-            articulation_enabled=False,
         ),
         copy_from_source=False,
     ),

@@ -3,31 +3,24 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Tuple
 
-import gymnasium as gym
-import numpy as np
 import torch
 
 import isaaclab.sim as sim_utils
 import isaaclab.utils.math as math_utils
 from isaaclab.assets import RigidObject, RigidObjectCfg
-from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
+from isaaclab.envs import DirectRLEnv
 from isaaclab.envs.ui import BaseEnvWindow
 from isaaclab.markers import (
-    BLUE_ARROW_X_MARKER_CFG,
     CUBOID_MARKER_CFG,
     GREEN_ARROW_X_MARKER_CFG,
-    RED_ARROW_X_MARKER_CFG,
     VisualizationMarkers,
 )
-from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sim import SimulationCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_apply, quat_conjugate
 
-from .assets.warpauv import WARPAUV_CFG
 from .rigid_body_hydrodynamics import HydrodynamicForceModels
 from .thruster_dynamics import ConversionFunctionBasic, DynamicsFirstOrder, get_thruster_com_and_orientations
+from .warpauv_env_cfg import WarpAUVEnvCfg
 
 
 class WarpAUVEnvWindow(BaseEnvWindow):
@@ -43,77 +36,7 @@ class WarpAUVEnvWindow(BaseEnvWindow):
                     self._create_debug_vis_ui_element("targets", self.env)
 
 
-@configclass
-class WarpAUVEnvCfg(DirectRLEnvCfg):
-    ui_window_class_type = WarpAUVEnvWindow
-
-    sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=2)
-    # Robot.
-    robot_cfg: RigidObjectCfg = WARPAUV_CFG.replace(prim_path="/World/envs/env_.*/Robot")
-    # Scene.
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4, env_spacing=4.0, replicate_physics=True)
-    debug_vis = True
-
-    observation_space: gym.spaces.Space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(17,), dtype=np.float64)
-    action_space: gym.spaces.Space = gym.spaces.Box(low=-1.0, high=1.0, shape=(6,), dtype=np.float64)
-    state_space: gym.spaces.Space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(17,), dtype=np.float64)
-    # Environment.
-    decimation = 2
-    cap_episode_length = True
-    episode_length_s = 3.0
-    episode_length_before_reset = None
-    num_actions = 6
-    num_observations = 17
-    num_states = 0
-    use_boundaries = True
-    max_auv_x = 7.0
-    max_auv_y = 7.0
-    max_auv_z = 7.0
-    starting_depth = 8.0
-    min_goal_steps = 100
-    goal_completion_radius = 0.01
-    goal_dims = 4
-    eval_mode = False
-
-    goal_spawn_radius = 2.0
-    init_guidance_rate = 0.1
-    init_vel_max = 1.0
-
-    # Rewards.
-    rew_scale_terminated = 0.0
-    rew_scale_alive = 0.0
-    rew_scale_completion = 1000.0
-    rew_scale_pos = 0.2
-    rew_scale_ang = 0.5
-    rew_scale_vel = 0.0
-    rew_scale_ang_vel = 0.0
-    rew_scale_lin_vel = 0.0
-    rew_scale_actions = 0.2
-
-    # Dynamics.
-    # Add this XYZ offset to COM to obtain the center of buoyancy location.
-    com_to_cob_offset = [0.0, 0.0, 0.01]
-    # kg/m^3
-    water_rho = 997.0
-    # Pa s, dynamic viscosity of water @ 50 deg F
-    water_beta = 0.001306
-    # Rotor constant used in Gazebo. The original source divides by 10 because
-    # 0.04 was treated as roughly 10x larger than desired.
-    rotor_constant = 0.1 / 100.0
-    # Time constant for first-order motor dynamics.
-    dyn_time_constant = 0.05
-    # Assumed cubic meters, chosen to be near neutrally buoyant.
-    volume = 0.022747843530591776
-    # kg
-    mass = 2.2701e01
-
-    class domain_randomization:
-        use_custom_randomization = True
-        # Uniformly sample an offset from a sphere around the nominal COM->COB.
-        com_to_cob_offset_radius = 0.05
-        # Uniform lower/upper bounds for displaced volume.
-        volume_range = [0.019747843530591773, 0.02574784353059178]
-        mass_range = [2.2701e01, 2.2701e01]
+WarpAUVEnvCfg.ui_window_class_type = WarpAUVEnvWindow
 
 
 class WarpAUVEnv(DirectRLEnv):
@@ -125,10 +48,14 @@ class WarpAUVEnv(DirectRLEnv):
         # Debug mode?
         self._debug = False
         # Initialize buffers.
-        self._actions = torch.zeros(self.num_envs, 6, device=self.device)
+        self._actions = torch.zeros(self.num_envs, self.cfg.num_actions, device=self.device)
+        self._previous_actions = torch.zeros_like(self._actions)
         self._thrust = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self._moment = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self._goal = torch.zeros(self.num_envs, self.cfg.goal_dims, device=self.device)
+        self._target_heading = torch.tensor(self.cfg.target_heading, device=self.device, dtype=torch.float32).repeat(
+            self.num_envs, 1
+        )
         self._default_root_state = torch.zeros(self.num_envs, 13, device=self.device)
         self._completion_buffer = torch.zeros(self.num_envs, device=self.device)
         self._completed_envs = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
@@ -137,7 +64,12 @@ class WarpAUVEnv(DirectRLEnv):
         self._step_count = 0
 
         # Get thruster configurations.
-        self.thruster_com_offsets, self.thruster_quats = get_thruster_com_and_orientations(self.device)
+        self.thruster_com_offsets, self.thruster_quats = get_thruster_com_and_orientations(
+            self.device,
+            self.cfg.robot_cfg.spawn.usd_path,
+            self.cfg.thruster_prim_names,
+        )
+        self.num_thrusters = self.thruster_com_offsets.shape[0]
         self.thruster_com_offsets = self.thruster_com_offsets.unsqueeze(0).repeat(self.num_envs, 1, 1)
         self.thruster_quats = self.thruster_quats.repeat(self.num_envs, 1)
 
@@ -150,15 +82,13 @@ class WarpAUVEnv(DirectRLEnv):
         # Get specific information about the AUV.
         self._gravity_magnitude = torch.tensor(self.sim.cfg.gravity, device=self.device).norm()
 
-        # TODO: pull inertias from the model or PhysX view instead of approximating.
+        # TODO: pull inertias from the model or PhysX view directly.
         self.inertia_tensors = torch.zeros((self.num_envs, 3), device=self.device, dtype=torch.float, requires_grad=False)
-        # Estimated inertias from a solid rectangular prism model with approximate
-        # side lengths 0.7m, 0.4m, and 0.2m.
-        # Fake inertial values for WarpAUV based on
-        # I_ii = (1/12) * mass * (len_j**2 + len_k**2).
-        self.inertia_tensors[:, 0] = 0.37
-        self.inertia_tensors[:, 1] = 0.97
-        self.inertia_tensors[:, 2] = 1.19
+        # Principal inertias synchronized to the BlueROV Heavy URDF base_link:
+        # ixx=0.26, iyy=0.23, izz=0.37.
+        self.inertia_tensors[:, 0] = 0.26
+        self.inertia_tensors[:, 1] = 0.23
+        self.inertia_tensors[:, 2] = 0.37
 
         if self.cfg.mass:
             self.masses = torch.full((self.num_envs, 1), self.cfg.mass, device=self.device)
@@ -192,7 +122,9 @@ class WarpAUVEnv(DirectRLEnv):
 
         # Create the force calculation helpers and rotor dynamics models.
         self.force_calculation_functions = HydrodynamicForceModels(self.num_envs, self.device, False)
-        self.thruster_dynamics = DynamicsFirstOrder(self.num_envs, 6, self.cfg.dyn_time_constant, self.device)
+        self.thruster_dynamics = DynamicsFirstOrder(
+            self.num_envs, self.num_thrusters, self.cfg.dyn_time_constant, self.device
+        )
         self.thruster_conversion = ConversionFunctionBasic(self.cfg.rotor_constant)
 
     def _setup_scene(self):
@@ -202,12 +134,13 @@ class WarpAUVEnv(DirectRLEnv):
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
         self.scene.clone_environments(copy_from_source=False)
         self.scene.filter_collisions(global_prim_paths=[])
-        self.scene.articulations["robot"] = self._robot
+        self.scene.rigid_objects["robot"] = self._robot
 
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        self._previous_actions[:] = self._actions
         self._actions[:] = torch.clip(actions, -1, 1).to(self.device)
 
     def _apply_action(self) -> None:
@@ -215,43 +148,54 @@ class WarpAUVEnv(DirectRLEnv):
         self._robot.set_external_force_and_torque(self._thrust, self._moment)
 
     def _get_observations(self) -> dict:
-        # Express the displacement from the environment origin in body coordinates.
-        offset_from_origin_b = quat_apply(
-            quat_conjugate(self._robot.data.root_quat_w),
-            self._default_env_origins - self._robot.data.root_pos_w,
+        target_delta = self._goal - self._robot.data.root_pos_w
+        heading = quat_apply(
+            self._robot.data.root_quat_w,
+            torch.tensor([[1.0, 0.0, 0.0]], device=self.device).repeat(self.num_envs, 1),
         )
+        relative_heading = self._target_heading - heading
         obs = torch.cat(
             [
-                self._goal,
-                offset_from_origin_b,
+                target_delta,
                 self._robot.data.root_quat_w,
                 self._robot.data.root_lin_vel_b,
                 self._robot.data.root_ang_vel_b,
+                relative_heading,
             ],
             dim=-1,
         )
         return {"policy": obs}
 
     def _get_rewards(self) -> torch.Tensor:
-        offsets_from_origin = quat_apply(
-            quat_conjugate(self._robot.data.root_quat_w),
-            self._default_env_origins - self._robot.data.root_pos_w,
+        target_delta = self._goal - self._robot.data.root_pos_w
+        heading = quat_apply(
+            self._robot.data.root_quat_w,
+            torch.tensor([[1.0, 0.0, 0.0]], device=self.device).repeat(self.num_envs, 1),
+        )
+        relative_heading = self._target_heading - heading
+        body_up = quat_apply(
+            self._robot.data.root_quat_w,
+            torch.tensor([[0.0, 0.0, 1.0]], device=self.device).repeat(self.num_envs, 1),
         )
         return _compute_rewards(
+            self.cfg.rew_scale_completion,
             self.cfg.rew_scale_pos,
             self.cfg.rew_scale_ang,
             self.cfg.rew_scale_lin_vel,
             self.cfg.rew_scale_ang_vel,
             self.cfg.rew_scale_actions,
+            self.cfg.rew_scale_z,
+            self.cfg.rew_scale_smooth,
+            self.cfg.rew_scale_upright,
+            self.cfg.reward_distance_scale,
             self._robot.data.root_lin_vel_b,
             self._robot.data.root_ang_vel_b,
-            self.reset_terminated,
-            self._robot.data.root_pos_w,
-            self._robot.data.root_quat_w,
-            self._goal,
-            offsets_from_origin,
-            self._completed_envs,
+            target_delta,
+            relative_heading,
+            body_up[:, 2],
             self._actions,
+            self._previous_actions,
+            self._completed_envs,
         )
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -265,6 +209,21 @@ class WarpAUVEnv(DirectRLEnv):
         if self.cfg.episode_length_before_reset and self._step_count == self.cfg.episode_length_before_reset:
             time_out = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
 
+        target_delta = self._goal - self._robot.data.root_pos_w
+        xy_error = torch.norm(target_delta[:, :2], dim=1)
+        z_error = torch.abs(target_delta[:, 2])
+        speed = torch.norm(self._robot.data.root_lin_vel_b, dim=1)
+        success_now = (
+            (xy_error < self.cfg.goal_completion_radius)
+            & (z_error < self.cfg.goal_z_radius)
+            & (speed < self.cfg.success_speed_threshold)
+        )
+        self._completion_buffer[success_now] += 1
+        self._completion_buffer[~success_now] = 0
+        self._completed_envs[:] = self._completion_buffer >= self.cfg.min_goal_steps
+
+        distance = torch.norm(target_delta, dim=1)
+
         if self.cfg.use_boundaries:
             out_of_bounds = (
                 (torch.abs(self._robot.data.root_pos_w[:, 0] - self.scene.env_origins[:, 0]) > self.cfg.max_auv_x)
@@ -274,7 +233,10 @@ class WarpAUVEnv(DirectRLEnv):
         else:
             out_of_bounds = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
-        return out_of_bounds, time_out
+        misbehave = (self._robot.data.root_pos_w[:, 2] < 0.2) | (distance > self.cfg.goal_max_distance)
+        has_nan = torch.isnan(self._robot.data.root_pos_w).any(dim=1) | torch.isnan(self._robot.data.root_lin_vel_b).any(dim=1)
+
+        return out_of_bounds | self._completed_envs | misbehave | has_nan, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
@@ -284,30 +246,48 @@ class WarpAUVEnv(DirectRLEnv):
         self._default_root_state[env_ids, :] = self._robot.data.default_root_state[env_ids]
         self._default_root_state[env_ids, :3] += self.scene.env_origins[env_ids]
         self._default_env_origins[env_ids, :] = self._default_root_state[env_ids, :3]
+        self._default_root_state[env_ids, 2] = self.cfg.starting_depth
+        self._default_root_state[env_ids, 7:13] = 0.0
+        self._completion_buffer[env_ids] = 0.0
+        self._completed_envs[env_ids] = False
+        self._actions[env_ids] = 0.0
+        self._previous_actions[env_ids] = 0.0
+
+        # Reset goals first so the initial state can be sampled above them.
+        self._reset_goal(env_ids)
 
         if not self.cfg.eval_mode:
-            # Randomize initial position relative to the origin.
-            self._default_root_state[env_ids, :3] += self._sample_from_sphere(len(env_ids), self.cfg.goal_spawn_radius)
+            # Initialize near the target point in xy, but above it in z.
+            self._default_root_state[env_ids, :2] = (
+                self._goal[env_ids, :2]
+                + self._sample_from_circle(len(env_ids), self.cfg.init_xy_noise_radius)
+            )
+            self._default_root_state[env_ids, 2] = self._goal[env_ids, 2] + math_utils.sample_uniform(
+                self.cfg.init_height_above_goal_range[0],
+                self.cfg.init_height_above_goal_range[1],
+                (len(env_ids),),
+                self.device,
+            )
 
         self._step_count = 0
         # Apply domain randomization.
         self._reset_domain(env_ids)
-        # Reset goals.
-        self._reset_goal(env_ids)
 
         if not self.cfg.eval_mode:
-            # Apply guidance by snapping a subset of envs to the target pose.
+            # Apply guidance by snapping a subset of envs even closer above the target point.
             envs_to_guide = math_utils.sample_uniform(0, 1, len(env_ids), self.device) < self.cfg.init_guidance_rate
             env_ids_to_guide = env_ids[envs_to_guide]
-            self._default_root_state[env_ids_to_guide, :3] = self._default_env_origins[env_ids_to_guide, :3]
-            self._default_root_state[env_ids_to_guide, 3:7] = self._goal[env_ids_to_guide, 0:4]
+            self._default_root_state[env_ids_to_guide, :2] = self._goal[env_ids_to_guide, :2]
+            self._default_root_state[env_ids_to_guide, 2] = self._goal[env_ids_to_guide, 2] + 0.2
 
         self._robot.write_root_pose_to_sim(self._default_root_state[env_ids, :7], env_ids)
         self._robot.write_root_velocity_to_sim(self._default_root_state[env_ids, 7:], env_ids)
 
     def _reset_goal(self, env_ids: Sequence[int]):
-        # Sample a random full orientation target.
-        self._goal[env_ids, 0:4] = math_utils.random_orientation(len(env_ids), device=self.device)
+        planar_offsets = self._sample_from_circle(len(env_ids), self.cfg.goal_spawn_radius)
+        self._goal[env_ids, :2] = self._default_env_origins[env_ids, :2] + planar_offsets
+        self._goal[env_ids, 2] = self.cfg.starting_depth
+        self._goal_pos_w[env_ids] = self._goal[env_ids]
 
     def _reset_domain(self, env_ids: Sequence[int]):
         if self.cfg.domain_randomization.use_custom_randomization:
@@ -326,6 +306,13 @@ class WarpAUVEnv(DirectRLEnv):
         radii = radius * torch.pow(torch.rand((num_env_ids, 1), device=self.device), 1 / 3)
         return radii * coords
 
+    def _sample_from_circle(self, num_env_ids: int, radius: float):
+        sampled_radius = radius * torch.sqrt(torch.rand((num_env_ids, 1), device=self.device))
+        sampled_theta = torch.rand((num_env_ids, 1), device=self.device) * 2 * torch.pi
+        sampled_x = sampled_radius * torch.cos(sampled_theta)
+        sampled_y = sampled_radius * torch.sin(sampled_theta)
+        return torch.cat([sampled_x, sampled_y], dim=1)
+
     def _compute_dynamics(self, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute net force/torque from actions.
@@ -333,7 +320,7 @@ class WarpAUVEnv(DirectRLEnv):
         Actions are in [-1, 1] and represent PWM-like commands, where -1 is full
         reverse thrust and 1 is full forward thrust.
         """
-        thruster_forces = torch.zeros((self.num_envs, 6, 3), device=self.device, dtype=torch.float)
+        thruster_forces = torch.zeros((self.num_envs, self.num_thrusters, 3), device=self.device, dtype=torch.float)
         motor_values = torch.clone(actions)
 
         # Convert PWM commands to rad/s using the mapping from the original
@@ -402,18 +389,6 @@ class WarpAUVEnv(DirectRLEnv):
                 marker_cfg.prim_path = "/Visuals/Command/goal_position"
                 self.goal_pos_visualizer = VisualizationMarkers(marker_cfg)
 
-            if not hasattr(self, "goal_ang_visualizer"):
-                marker_cfg = RED_ARROW_X_MARKER_CFG.copy()
-                marker_cfg.prim_path = "/Visuals/Command/goal_ang"
-                marker_cfg.markers["arrow"].scale = (0.125, 0.125, 1.0)
-                self.goal_ang_visualizer = VisualizationMarkers(marker_cfg)
-
-            if not hasattr(self, "goal_z_ang_visualizer"):
-                marker_cfg = BLUE_ARROW_X_MARKER_CFG.copy()
-                marker_cfg.prim_path = "/Visuals/Command/goal_z_ang"
-                marker_cfg.markers["arrow"].scale = (0.125, 0.125, 1.0)
-                self.goal_z_ang_visualizer = VisualizationMarkers(marker_cfg)
-
             if not hasattr(self, "x_b_visualizer"):
                 marker_cfg = GREEN_ARROW_X_MARKER_CFG.copy()
                 marker_cfg.markers["arrow"].scale = (0.125, 0.125, 1.0)
@@ -428,17 +403,11 @@ class WarpAUVEnv(DirectRLEnv):
 
             # Set all markers visible.
             self.goal_pos_visualizer.set_visibility(True)
-            self.goal_ang_visualizer.set_visibility(True)
-            self.goal_z_ang_visualizer.set_visibility(True)
             self.x_b_visualizer.set_visibility(True)
             self.z_b_visualizer.set_visibility(True)
         else:
             if hasattr(self, "goal_pos_visualizer"):
                 self.goal_pos_visualizer.set_visibility(False)
-            if hasattr(self, "goal_ang_visualizer"):
-                self.goal_ang_visualizer.set_visibility(False)
-            if hasattr(self, "goal_z_ang_visualizer"):
-                self.goal_z_ang_visualizer.set_visibility(False)
             if hasattr(self, "x_b_visualizer"):
                 self.x_b_visualizer.set_visibility(False)
             if hasattr(self, "z_b_visualizer"):
@@ -473,21 +442,6 @@ class WarpAUVEnv(DirectRLEnv):
 
         marker_scales = torch.tensor([1.0, 1.0, 1.0], device=self.device).repeat(self.num_envs, 1)
         marker_scales[:, 0] = 1.0
-        # Visualize goal orientations.
-        self.goal_ang_visualizer.visualize(
-            translations=self._robot.data.root_pos_w,
-            orientations=self._goal,
-            scales=marker_scales,
-        )
-
-        # Visualize goal orientation through the body Z-axis as well.
-        goal_z_quat = self._rotate_quat_by_euler_xyz(self._goal, 0.0, -torch.pi / 2, 0.0)
-        self.goal_z_ang_visualizer.visualize(
-            translations=self._robot.data.root_pos_w,
-            orientations=goal_z_quat,
-            scales=marker_scales,
-        )
-
         self.x_b_visualizer.visualize(
             translations=self._robot.data.root_pos_w,
             orientations=self._robot.data.root_quat_w,
@@ -505,28 +459,45 @@ class WarpAUVEnv(DirectRLEnv):
 
 @torch.jit.script
 def _compute_rewards(
+    rew_scale_completion: float,
     rew_scale_pos: float,
     rew_scale_ang: float,
     rew_scale_lin_vel: float,
     rew_scale_ang_vel: float,
     rew_scale_actions: float,
+    rew_scale_z: float,
+    rew_scale_smooth: float,
+    rew_scale_upright: float,
+    reward_distance_scale: float,
     lin_vel: torch.Tensor,
     ang_vel: torch.Tensor,
-    reset_terminated: torch.Tensor,
-    root_pos: torch.Tensor,
-    root_quat: torch.Tensor,
-    goal: torch.Tensor,
-    offsets_from_origin: torch.Tensor,
-    completed_envs: torch.Tensor,
+    goal_delta: torch.Tensor,
+    relative_heading: torch.Tensor,
+    uprightness: torch.Tensor,
     actions: torch.Tensor,
+    previous_actions: torch.Tensor,
+    completed_envs: torch.Tensor,
 ):
-    del rew_scale_lin_vel, lin_vel, reset_terminated, root_pos, completed_envs
-    # Reward position accuracy.
-    rew_pos = rew_scale_pos * torch.exp(-torch.norm(offsets_from_origin, dim=1) ** 2)
-    # Reward angular accuracy.
-    rew_ang = rew_scale_ang * torch.exp(-math_utils.quat_error_magnitude(goal[:, :], root_quat[:, :]))
-    # Penalize angular velocity.
-    rew_ang_vel = rew_scale_ang_vel * torch.exp(-torch.norm(ang_vel, dim=1) ** 2)
-    # Penalize energy consumption.
-    rew_action = rew_scale_actions * torch.exp(-torch.norm(actions, dim=1) ** 2)
-    return rew_ang + rew_action + rew_pos + rew_ang_vel
+    z_error = torch.abs(goal_delta[:, 2])
+    distance = torch.norm(torch.cat([goal_delta, relative_heading], dim=1), dim=1)
+    spin = torch.square(ang_vel[:, 2])
+    action_delta = torch.norm(actions - previous_actions, dim=1)
+
+    reward_pose = 0.5 * rew_scale_pos / (1.0 + torch.square(reward_distance_scale * distance))
+    rew_z = rew_scale_z * torch.exp(-torch.square(2.0 * z_error))
+    rew_vel = rew_scale_lin_vel * torch.exp(-torch.square(torch.norm(lin_vel, dim=1)))
+    rew_upright = rew_scale_upright * torch.square(torch.clamp((uprightness + 1.0) / 2.0, min=0.0, max=1.0))
+    rew_ang_vel = rew_scale_ang_vel * torch.exp(-torch.square(torch.norm(ang_vel, dim=1)))
+    rew_spin = 1.0 / (1.0 + torch.square(spin))
+    rew_action = rew_scale_actions * torch.exp(-torch.norm(actions, dim=1))
+    rew_smooth = rew_scale_smooth * torch.exp(-action_delta)
+    rew_heading = rew_scale_ang * torch.exp(-torch.norm(relative_heading, dim=1))
+    rew_completion = rew_scale_completion * completed_envs.float()
+
+    return (
+        reward_pose
+        + reward_pose * (rew_upright + rew_spin + rew_heading + rew_z + rew_vel + rew_ang_vel)
+        + rew_action
+        + rew_smooth
+        + rew_completion
+    )

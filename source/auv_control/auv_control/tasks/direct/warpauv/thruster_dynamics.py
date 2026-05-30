@@ -4,73 +4,107 @@ Thruster dynamics and model for WarpAUV.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import re
+from typing import Sequence
 
 import torch
 
-from isaaclab.utils.math import quat_from_euler_xyz
+
+def _normalize_identifier(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
-def get_thruster_com_and_orientations(device: torch.device):
+def get_thruster_com_and_orientations(
+    device: torch.device,
+    usd_path: str,
+    thruster_prim_names: Sequence[str],
+):
     """
-    Return thruster extrinsics for a single vehicle.
+    Return thruster extrinsics for a single vehicle by reading the USD asset.
 
     TODO: This would be cleaner if it came directly from the USD/URDF model
     through named actuators instead of being hard-coded here.
     """
-    def create_tf_rpy(x, y, z, rr, rp, ry):
-        shift = torch.tensor([x, y, z], dtype=torch.float32)
-        quat = quat_from_euler_xyz(
-            torch.tensor([rr], dtype=torch.float32),
-            torch.tensor([rp], dtype=torch.float32),
-            torch.tensor([ry], dtype=torch.float32),
-        )[0]
-        return shift, quat
+    try:
+        from pxr import Gf, Usd, UsdGeom
+    except ImportError as exc:
+        raise ImportError("Reading thruster transforms from USD requires the pxr Python package.") from exc
 
-    def create_tf_quat(x, y, z, w, vx, vy, vz):
-        shift = torch.tensor([x, y, z], dtype=torch.float32)
-        quat = torch.tensor([w, vx, vy, vz], dtype=torch.float32)
-        return shift, quat
+    stage = Usd.Stage.Open(usd_path)
+    if stage is None:
+        raise FileNotFoundError(f"Unable to open USD asset: {usd_path}")
 
-    thruster_info = dict(
-        drive_left=create_tf_quat(-0.4127, 0.1506, -0.0889, 1.0, 0.0, 0.0, 0.0),
-        drive_right=create_tf_quat(-0.4127, -0.1506, -0.0889, 1.0, 0.0, 0.0, 0.0),
-        rear_left=create_tf_rpy(-0.3030, 0.1461, -0.1587, 0.0, -0.785398, 1.5708),
-        rear_right=create_tf_rpy(-0.3030, -0.1461, -0.1587, 0.0, -0.785398, -1.5708),
-        front_right=create_tf_rpy(0.0585, -0.1461, -0.0540, 0.0, 0.785398, -1.5708),
-        front_left=create_tf_rpy(0.0585, 0.1461, -0.0540, 0.0, 0.785398, 1.5708),
-    )
+    root_prim = stage.GetDefaultPrim()
+    if not root_prim:
+        raise ValueError(f"USD asset has no default prim: {usd_path}")
+    xform_cache = UsdGeom.XformCache()
+
+    normalized_to_prim = {}
+    for prim in stage.Traverse():
+        if not prim.IsValid():
+            continue
+        normalized_to_prim[_normalize_identifier(str(prim.GetPath()))] = prim
+        normalized_to_prim[_normalize_identifier(prim.GetName())] = prim
+
+    thruster_positions = []
+    thruster_quats = []
 
     # Vector pointing from COM to thruster location, shape: (thruster, 3).
-    # Thruster ordering:
-    # 0 - drive_left
-    # 1 - drive_right
-    # 2 - rear_left
-    # 3 - rear_right
-    # 4 - front_left
-    # 5 - front_right
-    thruster_com_offsets = torch.stack(
-        [
-            thruster_info["drive_left"][0],
-            thruster_info["drive_right"][0],
-            thruster_info["rear_left"][0],
-            thruster_info["rear_right"][0],
-            thruster_info["front_left"][0],
-            thruster_info["front_right"][0],
-        ],
-        dim=0,
-    ).to(device)
     # Quaternion mapping COM frame -> thruster frame, shape: (thruster, 4).
-    thruster_quats = torch.stack(
-        [
-            thruster_info["drive_left"][1],
-            thruster_info["drive_right"][1],
-            thruster_info["rear_left"][1],
-            thruster_info["rear_right"][1],
-            thruster_info["front_left"][1],
-            thruster_info["front_right"][1],
-        ],
-        dim=0,
-    ).to(device)
+    for thruster_name in thruster_prim_names:
+        normalized_name = _normalize_identifier(thruster_name)
+        matches = []
+        for key, prim in normalized_to_prim.items():
+            if normalized_name in key:
+                matches.append(prim)
+
+        unique_matches = []
+        seen_paths = set()
+        for prim in matches:
+            path = str(prim.GetPath())
+            if path not in seen_paths:
+                seen_paths.add(path)
+                unique_matches.append(prim)
+
+        if len(unique_matches) != 1:
+            raise ValueError(
+                f"Expected exactly one USD prim match for thruster '{thruster_name}', found "
+                f"{len(unique_matches)} in asset {usd_path}."
+            )
+
+        prim = unique_matches[0]
+        xformable = UsdGeom.Xformable(prim)
+        root_xformable = UsdGeom.Xformable(root_prim)
+
+        if hasattr(xformable, "ComputeRelativeTransform"):
+            relative_matrix, _ = xformable.ComputeRelativeTransform(root_prim)
+        else:
+            # Older USD Python bindings commonly expose only local-to-world
+            # transforms, so compute the relative transform manually.
+            prim_world = xform_cache.GetLocalToWorldTransform(prim)
+            root_world = xform_cache.GetLocalToWorldTransform(root_prim)
+            relative_matrix = prim_world * root_world.GetInverse()
+
+            # If the root itself has no authored xform ops, the direct local
+            # transform on the thruster prim is often already the desired value.
+            if not root_xformable:
+                local_matrix, _ = xformable.GetLocalTransformation()
+                relative_matrix = local_matrix
+
+        transform = Gf.Transform(relative_matrix)
+        translation = transform.GetTranslation()
+        rotation = transform.GetRotation().GetQuat()
+        imag = rotation.GetImaginary()
+
+        thruster_positions.append(
+            torch.tensor([translation[0], translation[1], translation[2]], dtype=torch.float32, device=device)
+        )
+        thruster_quats.append(
+            torch.tensor([rotation.GetReal(), imag[0], imag[1], imag[2]], dtype=torch.float32, device=device)
+        )
+
+    thruster_com_offsets = torch.stack(thruster_positions, dim=0).to(device)
+    thruster_quats = torch.stack(thruster_quats, dim=0).to(device)
     return thruster_com_offsets, thruster_quats
 
 
@@ -117,11 +151,8 @@ class DynamicsFirstOrder(Dynamics):
         self.prev_time[self.prev_time < 0] = t[self.prev_time < 0]
         # Because dt = 0 for freshly initialized envs, alpha would be 1.0 and the
         # state would remain unchanged on the first step.
-        dt = t - self.prev_time
+        dt = torch.clamp(t - self.prev_time, min=0.0)
         alpha = torch.exp(-dt / self.tau)
-        # NOTE: This follows the original source exactly: alpha is zeroed out so the
-        # state snaps directly to the command instead of applying first-order lag.
-        alpha = torch.zeros_like(alpha)
         self.state = self.state * alpha.unsqueeze(-1) + (1.0 - alpha).unsqueeze(-1) * cmd
         self.prev_time = t
         return self.state

@@ -6,7 +6,8 @@
 import gymnasium as gym
 
 from . import agents
-from .warpauv_env import WarpAUVEnv, WarpAUVEnvCfg
+from .warpauv_env import WarpAUVEnv
+from .warpauv_env_cfg import WarpAUVEnvCfg
 
 
 gym.register(
