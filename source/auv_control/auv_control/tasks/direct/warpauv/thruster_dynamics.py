@@ -115,11 +115,9 @@ class Dynamics(ABC):
         self.device = device
         self.reset_all()
 
-    def reset(self, mask_arr: torch.Tensor):
-        # mask_arr is a boolean tensor of shape (num_envs,) marking which
-        # environments should reset their thruster state.
-        self.state[mask_arr, :] = 0.0
-        self.prev_time[mask_arr] = -1.0
+    def reset(self, env_ids: torch.Tensor):
+        self.state[env_ids, :] = 0.0
+        self.prev_time[env_ids] = -1.0
 
     def reset_all(self):
         self.state = torch.zeros(
@@ -158,6 +156,67 @@ class DynamicsFirstOrder(Dynamics):
         return self.state
 
 
+class DynamicsT200(Dynamics):
+    def __init__(
+        self,
+        num_envs: int,
+        num_thrusters_per_env: int,
+        tau_up: float,
+        tau_down: float,
+        time_constant: float,
+        deadzone: float,
+        forward_gain: float,
+        forward_offset: float,
+        reverse_gain: float,
+        reverse_offset: float,
+        device: torch.device,
+    ):
+        self.tau_up = tau_up
+        self.tau_down = tau_down
+        self.time_constant = time_constant
+        self.deadzone = deadzone
+        self.forward_gain = forward_gain
+        self.forward_offset = forward_offset
+        self.reverse_gain = reverse_gain
+        self.reverse_offset = reverse_offset
+        super().__init__(num_envs=num_envs, num_thrusters_per_env=num_thrusters_per_env, device=device)
+
+    def reset_all(self):
+        super().reset_all()
+        self.throttle = torch.zeros(
+            (self.num_envs, self.num_thrusters_per_env),
+            dtype=torch.float32,
+            device=self.device,
+            requires_grad=False,
+        )
+
+    def reset(self, env_ids: torch.Tensor):
+        super().reset(env_ids)
+        self.throttle[env_ids, :] = 0.0
+
+    def update(self, cmd: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        self.prev_time[self.prev_time < 0] = t[self.prev_time < 0]
+        tau = torch.where(cmd > self.throttle, self.tau_up, self.tau_down)
+        tau = torch.clamp(torch.as_tensor(tau, device=self.device, dtype=torch.float32), 0.0, 1.0)
+        self.throttle = self.throttle + tau * (cmd - self.throttle)
+
+        target_rpm = torch.where(
+            self.throttle > self.deadzone,
+            self.forward_gain * self.throttle + self.forward_offset,
+            torch.where(
+                self.throttle < -self.deadzone,
+                self.reverse_gain * self.throttle - self.reverse_offset,
+                torch.zeros_like(self.throttle),
+            ),
+        )
+
+        dt = torch.clamp(t - self.prev_time, min=0.0)
+        alpha = torch.exp(-dt / self.time_constant)
+        self.state = self.state * alpha.unsqueeze(-1) + (1.0 - alpha).unsqueeze(-1) * target_rpm
+        self.prev_time = t
+        return self.state
+
+
 @dataclass
 class ConversionFunction(ABC):
     @abstractmethod
@@ -175,3 +234,18 @@ class ConversionFunctionBasic(ConversionFunction):
     def convert(self, cmd: torch.Tensor) -> torch.Tensor:
         # Convert rotor angular velocity command into thrust.
         return self.rotor_constant * torch.abs(cmd) * cmd
+
+
+class ConversionFunctionT200(ConversionFunction):
+    force_constant_scale: float
+
+    def __init__(self, force_constant_scale: float = 1.0):
+        super().__init__()
+        self.force_constant_scale = force_constant_scale
+
+    # 根据经验模型，将电机转速转换为推力
+    def convert(self, cmd: torch.Tensor) -> torch.Tensor:
+        positive_thrust = 4.7368e-07 * torch.square(cmd) - 1.9275e-04 * cmd + 8.4452e-02
+        negative_thrust = -3.8442e-07 * torch.square(cmd) - 1.6186e-04 * cmd - 3.9139e-02
+        thrust_kgf = torch.where(cmd > 0.0, positive_thrust, negative_thrust)
+        return self.force_constant_scale * 9.81 * thrust_kgf

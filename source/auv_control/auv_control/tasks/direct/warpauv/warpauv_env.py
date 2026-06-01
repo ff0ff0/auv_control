@@ -19,7 +19,13 @@ from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.math import quat_apply, quat_conjugate
 
 from .rigid_body_hydrodynamics import HydrodynamicForceModels
-from .thruster_dynamics import ConversionFunctionBasic, DynamicsFirstOrder, get_thruster_com_and_orientations
+from .thruster_dynamics import (
+    ConversionFunctionBasic,
+    ConversionFunctionT200,
+    DynamicsFirstOrder,
+    DynamicsT200,
+    get_thruster_com_and_orientations,
+)
 from .warpauv_env_cfg import WarpAUVEnvCfg
 
 
@@ -62,6 +68,9 @@ class WarpAUVEnv(DirectRLEnv):
         self._default_env_origins = torch.zeros(self.num_envs, 3, device=self.device)
         self._goal_pos_w = self._default_env_origins  # Used by debug visualization.
         self._step_count = 0
+        self._flow_vels_w = torch.tensor(self.cfg.flow_velocity, device=self.device, dtype=torch.float32).repeat(
+            self.num_envs, 1
+        )
 
         # Get thruster configurations.
         self.thruster_com_offsets, self.thruster_quats = get_thruster_com_and_orientations(
@@ -106,7 +115,6 @@ class WarpAUVEnv(DirectRLEnv):
         else:
             self.volumes = self.cfg.volume.clone()
 
-        self.inertia_tensors_mean = self.inertia_tensors.mean(dim=1, keepdim=True)
         # Initialize dynamics calculators.
         self._init_thruster_dynamics()
         # Set initial goals.
@@ -121,11 +129,36 @@ class WarpAUVEnv(DirectRLEnv):
             )
 
         # Create the force calculation helpers and rotor dynamics models.
-        self.force_calculation_functions = HydrodynamicForceModels(self.num_envs, self.device, False)
-        self.thruster_dynamics = DynamicsFirstOrder(
-            self.num_envs, self.num_thrusters, self.cfg.dyn_time_constant, self.device
+        self.force_calculation_functions = HydrodynamicForceModels(
+            self.num_envs,
+            self.device,
+            self.step_dt,
+            torch.tensor(self.cfg.added_mass_diag, device=self.device, dtype=torch.float32),
+            torch.tensor(self.cfg.linear_damping_diag, device=self.device, dtype=torch.float32),
+            torch.tensor(self.cfg.quadratic_damping_diag, device=self.device, dtype=torch.float32),
+            self.cfg.hydro_accel_filter_alpha,
+            False,
         )
-        self.thruster_conversion = ConversionFunctionBasic(self.cfg.rotor_constant)
+        if self.cfg.use_marinegym_t200_model:
+            self.thruster_dynamics = DynamicsT200(
+                self.num_envs,
+                self.num_thrusters,
+                self.cfg.t200_tau_up,
+                self.cfg.t200_tau_down,
+                self.cfg.t200_time_constant,
+                self.cfg.t200_deadzone,
+                self.cfg.t200_forward_gain,
+                self.cfg.t200_forward_offset,
+                self.cfg.t200_reverse_gain,
+                self.cfg.t200_reverse_offset,
+                self.device,
+            )
+            self.thruster_conversion = ConversionFunctionT200(self.cfg.t200_force_constant_scale)
+        else:
+            self.thruster_dynamics = DynamicsFirstOrder(
+                self.num_envs, self.num_thrusters, self.cfg.dyn_time_constant, self.device
+            )
+            self.thruster_conversion = ConversionFunctionBasic(self.cfg.rotor_constant)
 
     def _setup_scene(self):
         self.cfg.robot_cfg.init_state = RigidObjectCfg.InitialStateCfg(pos=(0.0, 0.0, self.cfg.starting_depth))
@@ -143,8 +176,9 @@ class WarpAUVEnv(DirectRLEnv):
         self._previous_actions[:] = self._actions
         self._actions[:] = torch.clip(actions, -1, 1).to(self.device)
 
+    # 执行动作
     def _apply_action(self) -> None:
-        self._thrust[:, 0, :], self._moment[:, 0, :] = self._compute_dynamics(self._actions)
+        self._thrust[:, 0, :], self._moment[:, 0, :] = self._compute_dynamics(self._actions)        # 根据定义的运动学方程计算力和力矩
         self._robot.set_external_force_and_torque(self._thrust, self._moment)
 
     def _get_observations(self) -> dict:
@@ -221,7 +255,6 @@ class WarpAUVEnv(DirectRLEnv):
         self._completion_buffer[success_now] += 1
         self._completion_buffer[~success_now] = 0
         self._completed_envs[:] = self._completion_buffer >= self.cfg.min_goal_steps
-
         distance = torch.norm(target_delta, dim=1)
 
         if self.cfg.use_boundaries:
@@ -252,6 +285,8 @@ class WarpAUVEnv(DirectRLEnv):
         self._completed_envs[env_ids] = False
         self._actions[env_ids] = 0.0
         self._previous_actions[env_ids] = 0.0
+        self.force_calculation_functions.reset(env_ids)
+        self.thruster_dynamics.reset(env_ids)
 
         # Reset goals first so the initial state can be sampled above them.
         self._reset_goal(env_ids)
@@ -313,6 +348,7 @@ class WarpAUVEnv(DirectRLEnv):
         sampled_y = sampled_radius * torch.sin(sampled_theta)
         return torch.cat([sampled_x, sampled_y], dim=1)
 
+    # 将各个螺旋桨输入的PWM，转换为对应的力和力矩输出
     def _compute_dynamics(self, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute net force/torque from actions.
@@ -323,19 +359,20 @@ class WarpAUVEnv(DirectRLEnv):
         thruster_forces = torch.zeros((self.num_envs, self.num_thrusters, 3), device=self.device, dtype=torch.float)
         motor_values = torch.clone(actions)
 
-        # Convert PWM commands to rad/s using the mapping from the original
-        # WarpAUV simulation interface.
-        motor_values[torch.abs(motor_values) < 0.08] = 0.0
-        motor_values[motor_values >= 0.08] = (
-            -139.0 * torch.pow(motor_values[motor_values >= 0.08], 2.0)
-            + 500.0 * motor_values[motor_values >= 0.08]
-            + 8.28
-        )
-        motor_values[motor_values <= -0.08] = (
-            161.0 * torch.pow(motor_values[motor_values <= -0.08], 2.0)
-            + 517.86 * motor_values[motor_values <= -0.08]
-            - 5.72
-        )
+        if not self.cfg.use_marinegym_t200_model:
+            # Convert PWM commands to rad/s using the mapping from the original
+            # WarpAUV simulation interface.
+            motor_values[torch.abs(motor_values) < 0.08] = 0.0
+            motor_values[motor_values >= 0.08] = (
+                -139.0 * torch.pow(motor_values[motor_values >= 0.08], 2.0)
+                + 500.0 * motor_values[motor_values >= 0.08]
+                + 8.28
+            )
+            motor_values[motor_values <= -0.08] = (
+                161.0 * torch.pow(motor_values[motor_values <= -0.08], 2.0)
+                + 517.86 * motor_values[motor_values <= -0.08]
+                - 5.72
+            )
 
         # Apply thruster dynamics to obtain the current motor velocities.
         # TODO: double-check that the sim dt usage here matches the original.
@@ -363,21 +400,15 @@ class WarpAUVEnv(DirectRLEnv):
             abs(self._gravity_magnitude),
             self.com_to_cob_offsets,
         )
-        density_forces, density_torques, viscosity_forces, viscosity_torques = (
-            self.force_calculation_functions.calculate_density_and_viscosity_forces(
-                self._robot.data.root_quat_w,
-                self._robot.data.root_lin_vel_w,
-                self._robot.data.root_ang_vel_w,
-                self.inertia_tensors,
-                self.inertia_tensors_mean,
-                self.cfg.water_beta,
-                self.cfg.water_rho,
-                self.masses,
-            )
+        hydro_forces, hydro_torques = self.force_calculation_functions.calculate_hydrodynamic_wrench(
+            self._robot.data.root_lin_vel_b,
+            self._robot.data.root_ang_vel_b,
+            self._flow_vels_w,
+            self._robot.data.root_quat_w,
         )
 
-        forces = density_forces + buoyancy_forces + viscosity_forces + thruster_forces
-        torques = density_torques + buoyancy_torques + viscosity_torques + thruster_torques
+        forces = hydro_forces + buoyancy_forces + thruster_forces
+        torques = hydro_torques + buoyancy_torques + thruster_torques
         return forces, torques
 
     def _set_debug_vis_impl(self, debug_vis: bool):
